@@ -43,10 +43,10 @@ if GROUP_ID == 0:
 # CHANNELS — bisa juga dipindah ke .env kalau mau lebih aman
 # ============================================================
 CHANNELS: dict[str, str] = {
-    "Indo 🎬":    os.getenv("CH_INDO",   "https://t.me/channel_indo"),
-    "Japan 🎌":   os.getenv("CH_JAPAN",  "https://t.me/channel_japan"),
-    "Random 🎲":  os.getenv("CH_RANDOM", "https://t.me/channel_random"),
-    "Cosplay 👗": os.getenv("CH_COSPLAY","https://t.me/channel_cosplay"),
+    "Indo 🎬":    os.getenv("CH_INDO",   "https://t.me/+LjRDcKqEWfZkMTMx"),
+    "Japan 🎌":   os.getenv("CH_JAPAN",  "https://t.me/+eff65E8r95UwODNh"),
+    "Random 🎲":  os.getenv("CH_RANDOM", "https://t.me/+miONvlZdS2U4ZTVh"),
+    "Cosplay 👗": os.getenv("CH_COSPLAY","https://t.me/+HBACj3RPsiFhZWE5"),
 }
 
 # ============================================================
@@ -97,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("📌 Join Grup", url="https://t.me/testingwjr")],
+        [InlineKeyboardButton("📌 Join Grup", url="https://t.me/+5uw96pDwyzphMjhh")],
         [InlineKeyboardButton("✅ Cek Akses", callback_data="check")],
     ]
     await update.message.reply_text(
