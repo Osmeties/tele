@@ -14,6 +14,7 @@ import os
 import logging
 import time
 from collections import defaultdict
+from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,7 +28,7 @@ from telegram.error import Forbidden, BadRequest, TelegramError
 # ============================================================
 # LOAD ENV
 # ============================================================
-
+load_dotenv()
 
 TOKEN    = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
