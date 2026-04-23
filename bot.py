@@ -117,7 +117,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("📌 Join Grup", url="https://t.me/testingwjr")],
+        [InlineKeyboardButton("📌 Join Grup", url="https://t.me/+5uw96pDwyzphMjhh")],
         [InlineKeyboardButton("✅ Cek Akses", callback_data="check")],
     ]
     await update.message.reply_text(
