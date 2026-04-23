@@ -41,9 +41,9 @@ GROUP_LINK      = os.getenv("GROUP_LINK", "https://t.me/+5uw96pDwyzphMjhh")
 WELCOME_FILE_ID = os.getenv("WELCOME_FILE_ID", "")
 
 if not TOKEN:
-    raise EnvironmentError("❌ BOT_TOKEN tidak ditemukan!")
+    raise EnvironmentError("BOT_TOKEN tidak ditemukan!")
 if GROUP_ID == 0:
-    raise EnvironmentError("❌ GROUP_ID tidak ditemukan!")
+    raise EnvironmentError("GROUP_ID tidak ditemukan!")
 
 # ============================================================
 # CHANNELS
@@ -118,7 +118,7 @@ async def expire_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             message_id=message_id,
         )
-        logger.info("✅ Menu channel user %s berhasil dihapus", user_id)
+        logger.info("Menu channel user %s berhasil dihapus", user_id)
     except TelegramError:
         try:
             await context.bot.edit_message_text(
@@ -152,14 +152,12 @@ async def send_channel_menu(
         chat_id=chat_id,
         text=(
             "✅ Akses diberikan! Pilih channel:\n\n"
-            "⏳ Menu ini aktif selama *5 menit* dan akan otomatis terhapus."
+            "⏳ Menu ini aktif selama 5 menit dan akan otomatis terhapus."
         ),
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
         reply_to_message_id=reply_to_message_id,
     )
 
-    # Jadwalkan penghapusan setelah 5 menit
     context.job_queue.run_once(
         expire_menu,
         when=MENU_EXPIRE_SECONDS,
@@ -174,10 +172,9 @@ async def send_channel_menu(
     logger.info("Menu channel dikirim ke user %s, expire dalam %ds", user_id, MENU_EXPIRE_SECONDS)
 
 # ============================================================
-# PRIVATE CHAT — /start (gantikan /join)
+# PRIVATE CHAT — /start
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hanya aktif di private chat — arahkan user untuk join grup."""
     if update.effective_chat.type != "private":
         return
 
@@ -192,11 +189,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)],
     ]
     await update.message.reply_text(
-        "👋 Halo! Selamat datang di bot *Warkop Jam Rawan*\\!\n\n"
-        "⚠️ Kamu harus join grup dulu sebelum bisa akses channel\\.\n\n"
+        "👋 Halo! Selamat datang di bot Warkop Jam Rawan!\n\n"
+        "⚠️ Kamu harus join grup dulu sebelum bisa akses channel.\n\n"
         "Klik tombol di bawah untuk bergabung, "
-        "lalu ketik `/akses` di dalam grup untuk akses channel\\.",
-        parse_mode="MarkdownV2",
+        "lalu ketik /akses di dalam grup untuk akses channel.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -204,7 +200,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # GRUP — /akses
 # ============================================================
 async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hanya aktif di dalam grup — cek keanggotaan & tampilkan menu channel."""
     if update.effective_chat.type not in ("group", "supergroup"):
         await update.message.reply_text("⚠️ Perintah ini hanya bisa digunakan di dalam grup.")
         return
@@ -220,7 +215,7 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
 
         if member.status in ("member", "administrator", "creator"):
-            logger.info("✅ Akses DIBERIKAN ke user %s", user.id)
+            logger.info("Akses DIBERIKAN ke user %s", user.id)
             await send_channel_menu(
                 context=context,
                 chat_id=update.effective_chat.id,
@@ -228,7 +223,7 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_to_message_id=update.message.message_id,
             )
         else:
-            logger.info("❌ Akses DITOLAK user %s (status: %s)", user.id, member.status)
+            logger.info("Akses DITOLAK user %s (status: %s)", user.id, member.status)
             keyboard = [[InlineKeyboardButton("📌 Join Grup", url=GROUP_LINK)]]
             await update.message.reply_text(
                 "❌ Kamu belum join grup!\n\n"
@@ -261,7 +256,7 @@ async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_T
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
 
         if member.status in ("member", "administrator", "creator"):
-            logger.info("✅ Akses welcome DIBERIKAN ke user %s", user.id)
+            logger.info("Akses welcome DIBERIKAN ke user %s", user.id)
             await send_channel_menu(
                 context=context,
                 chat_id=query.message.chat_id,
@@ -290,16 +285,17 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat = update.effective_chat
     logger.info("Member baru join: %s (@%s)", user.id, user.username)
 
-    mention = f"[{user.first_name}](tg://user?id={user.id})"
+    # Gunakan HTML agar lebih aman dari karakter spesial
+    mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
 
     welcome_text = (
-        f"Selamat Datang {mention}\\! 👋\n\n"
+        f"Selamat Datang {mention}! 👋\n\n"
         "WELCOME TO WARKOP JAM RAWAN\n"
-        "🔥𝗧𝗘𝗠𝗣𝗔𝗧 𝗞𝗛𝗨𝗦𝗨𝗦 𝟭𝟴\\+🔥\n"
-        "KONTEN INDO TERUPDATE\\!\\!\n"
+        "🔥𝗧𝗘𝗠𝗣𝗔𝗧 𝗞𝗛𝗨𝗦𝗨𝗦 𝟭𝟴+🔥\n"
+        "KONTEN INDO TERUPDATE!!\n"
         "GRATIS TINGGAL NONTON\n"
         "DISINI👇👇👇\n\n"
-        "Ketik /akses di grup ini untuk akses channel\\!\n\n"
+        "Ketik /akses di grup ini untuk akses channel!\n\n"
         "Bisa request video di WJR Group ✔️\n"
         "Update Setiap Hari ✔️\n"
         "GRATIS seumur hidup ✔️"
@@ -315,14 +311,14 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=chat.id,
                 photo=WELCOME_FILE_ID,
                 caption=welcome_text,
-                parse_mode="MarkdownV2",
+                parse_mode="HTML",
                 reply_markup=keyboard,
             )
         else:
             await context.bot.send_message(
                 chat_id=chat.id,
                 text=welcome_text,
-                parse_mode="MarkdownV2",
+                parse_mode="HTML",
                 reply_markup=keyboard,
             )
     except TelegramError as e:
@@ -340,8 +336,7 @@ async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     context.user_data["waiting_photo"] = True
     await update.message.reply_text(
         "📸 Silakan kirim foto yang ingin dijadikan gambar welcome.\n\n"
-        "Bot akan membalas dengan `file_id` foto tersebut.",
-        parse_mode="Markdown",
+        "Bot akan membalas dengan file_id foto tersebut.",
     )
 
 # ============================================================
@@ -360,16 +355,15 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data["waiting_photo"] = False
 
     await update.message.reply_text(
-        f"✅ *File ID foto kamu:*\n\n"
-        f"`{file_id}`\n\n"
-        f"📋 *Cara pakai:*\n"
-        f"1\\. Copy `file_id` di atas\n"
-        f"2\\. Buka Railway Dashboard → Variables\n"
-        f"3\\. Tambahkan:\n"
-        f"   Key: `WELCOME_FILE_ID`\n"
-        f"   Value: \\(paste file\\_id\\)\n"
-        f"4\\. Klik Deploy\\!",
-        parse_mode="MarkdownV2",
+        f"✅ File ID foto kamu:\n\n"
+        f"{file_id}\n\n"
+        f"Cara pakai:\n"
+        f"1. Copy file_id di atas\n"
+        f"2. Buka Railway Dashboard → Variables\n"
+        f"3. Tambahkan:\n"
+        f"   Key: WELCOME_FILE_ID\n"
+        f"   Value: (paste file_id)\n"
+        f"4. Klik Deploy!",
     )
     logger.info("Admin mengambil file_id: %s", file_id)
 
@@ -382,9 +376,8 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        f"👤 *User ID kamu* : `{update.effective_user.id}`\n"
-        f"💬 *Chat ID sekarang* : `{update.effective_chat.id}`",
-        parse_mode="Markdown",
+        f"User ID kamu   : {update.effective_user.id}\n"
+        f"Chat ID sekarang: {update.effective_chat.id}",
     )
 
 # ============================================================
@@ -399,11 +392,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = await context.bot.get_chat(GROUP_ID)
         me   = await context.bot.get_chat_member(GROUP_ID, context.bot.id)
         await update.message.reply_text(
-            f"✅ *Bot terhubung ke grup:*\n"
-            f"📌 Nama   : {chat.title}\n"
-            f"🆔 ID     : `{chat.id}`\n"
-            f"🤖 Status : `{me.status}`",
-            parse_mode="Markdown",
+            f"✅ Bot terhubung ke grup:\n"
+            f"Nama   : {chat.title}\n"
+            f"ID     : {chat.id}\n"
+            f"Status : {me.status}",
         )
     except TelegramError as e:
         await update.message.reply_text(f"❌ Gagal cek grup: {e}")
@@ -418,7 +410,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # MAIN
 # ============================================================
 def main() -> None:
-    logger.info("🚀 Bot dimulai...")
+    logger.info("Bot dimulai...")
 
     app = (
         ApplicationBuilder()
@@ -440,7 +432,7 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Bot berjalan, polling...")
+    logger.info("Bot berjalan, polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
