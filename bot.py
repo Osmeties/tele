@@ -2,11 +2,12 @@
 Telegram Gate Bot - Full Secure Version
 ========================================
 Fitur:
-- PRIVATE CHAT : /join  → tombol join grup
-- GRUP         : /akses → cek keanggotaan & menu channel (expire 5 menit)
+- PRIVATE CHAT : /start → tombol join grup
+- GRUP         : /akses → cek keanggotaan & menu channel (expire 5 menit, otomatis terhapus)
 - Welcome message + gambar saat member baru join grup
 - /getfileid   → admin ambil file_id gambar (private chat)
 - Rate limiting per user (5 request / 60 detik)
+- Menu channel otomatis TERHAPUS setelah 5 menit
 - Logging lengkap (terminal + file)
 - Error handling spesifik
 - Admin-only commands (/id, /status, /getfileid)
@@ -78,7 +79,6 @@ logger = logging.getLogger(__name__)
 # STORAGE
 # ============================================================
 _rate_store: dict[int, list[float]] = defaultdict(list)
-channel_menu_time: dict[int, float] = {}
 
 # ============================================================
 # HELPERS
@@ -103,34 +103,86 @@ def extract_status_change(chat_member_update: ChatMemberUpdated):
     return was_member, is_member
 
 # ============================================================
-# PRIVATE CHAT — /start (info awal)
+# JOB: Expire menu — hapus pesan otomatis setelah 5 menit
+# ============================================================
+async def expire_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data       = context.job.data
+    chat_id    = data["chat_id"]
+    message_id = data["message_id"]
+    user_id    = data["user_id"]
+
+    logger.info("Expire menu untuk user %s", user_id)
+
+    try:
+        await context.bot.delete_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        logger.info("✅ Menu channel user %s berhasil dihapus", user_id)
+    except TelegramError:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⌛ Menu channel sudah kadaluarsa.\n\nKetik /akses untuk akses baru.",
+            )
+        except TelegramError as e:
+            logger.warning("Gagal expire menu user %s: %s", user_id, e)
+
+# ============================================================
+# HELPER: Kirim menu channel + jadwalkan expire
+# ============================================================
+async def send_channel_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    reply_to_message_id: int | None = None,
+) -> None:
+    # Batalkan job expire lama kalau ada
+    old_jobs = context.job_queue.get_jobs_by_name(f"expire_{user_id}")
+    for job in old_jobs:
+        job.schedule_removal()
+
+    keyboard = [
+        [InlineKeyboardButton(name, url=link)]
+        for name, link in CHANNELS.items()
+    ]
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ Akses diberikan! Pilih channel:\n\n"
+            "⏳ Menu ini aktif selama *5 menit* dan akan otomatis terhapus."
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+        reply_to_message_id=reply_to_message_id,
+    )
+
+    # Jadwalkan penghapusan setelah 5 menit
+    context.job_queue.run_once(
+        expire_menu,
+        when=MENU_EXPIRE_SECONDS,
+        data={
+            "chat_id":    sent.chat_id,
+            "message_id": sent.message_id,
+            "user_id":    user_id,
+        },
+        name=f"expire_{user_id}",
+    )
+
+    logger.info("Menu channel dikirim ke user %s, expire dalam %ds", user_id, MENU_EXPIRE_SECONDS)
+
+# ============================================================
+# PRIVATE CHAT — /start (gantikan /join)
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hanya aktif di private chat."""
+    """Hanya aktif di private chat — arahkan user untuk join grup."""
     if update.effective_chat.type != "private":
         return
 
     user = update.effective_user
     logger.info("/start dari user %s (@%s)", user.id, user.username)
-
-    await update.message.reply_text(
-        "👋 Halo! Selamat datang di bot *Warkop Jam Rawan*\\.\n\n"
-        "Gunakan perintah berikut:\n"
-        "📌 /join  → Bergabung ke grup\n\n"
-        "_Setelah join grup, ketik_ `/akses` _di dalam grup untuk akses channel\\._",
-        parse_mode="MarkdownV2",
-    )
-
-# ============================================================
-# PRIVATE CHAT — /join
-# ============================================================
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hanya aktif di private chat — kasih tombol join grup."""
-    if update.effective_chat.type != "private":
-        return
-
-    user = update.effective_user
-    logger.info("/join dari user %s (@%s)", user.id, user.username)
 
     if is_rate_limited(user.id):
         await update.message.reply_text("⏳ Terlalu banyak permintaan. Coba lagi nanti.")
@@ -140,7 +192,8 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)],
     ]
     await update.message.reply_text(
-        "⚠️ Kamu belum join grup\\!\n\n"
+        "👋 Halo! Selamat datang di bot *Warkop Jam Rawan*\\!\n\n"
+        "⚠️ Kamu harus join grup dulu sebelum bisa akses channel\\.\n\n"
         "Klik tombol di bawah untuk bergabung, "
         "lalu ketik `/akses` di dalam grup untuk akses channel\\.",
         parse_mode="MarkdownV2",
@@ -153,10 +206,7 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Hanya aktif di dalam grup — cek keanggotaan & tampilkan menu channel."""
     if update.effective_chat.type not in ("group", "supergroup"):
-        await update.message.reply_text(
-            "⚠️ Perintah ini hanya bisa digunakan di dalam grup\\.",
-            parse_mode="MarkdownV2",
-        )
+        await update.message.reply_text("⚠️ Perintah ini hanya bisa digunakan di dalam grup.")
         return
 
     user = update.effective_user
@@ -171,84 +221,61 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if member.status in ("member", "administrator", "creator"):
             logger.info("✅ Akses DIBERIKAN ke user %s", user.id)
-            channel_menu_time[user.id] = time.time()
-
-            keyboard = [
-                [InlineKeyboardButton(name, url=link)]
-                for name, link in CHANNELS.items()
-            ]
-
-            sent = await update.message.reply_text(
-                "✅ Akses diberikan\\! Pilih channel:\n\n"
-                "⏳ Menu ini aktif selama *5 menit*\\.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="MarkdownV2",
+            await send_channel_menu(
+                context=context,
+                chat_id=update.effective_chat.id,
+                user_id=user.id,
+                reply_to_message_id=update.message.message_id,
             )
-
-            # Batalkan job lama jika ada
-            old_jobs = context.job_queue.get_jobs_by_name(f"expire_{user.id}")
-            for job in old_jobs:
-                job.schedule_removal()
-
-            # Jadwalkan expire menu setelah 5 menit
-            context.job_queue.run_once(
-                expire_menu,
-                when=MENU_EXPIRE_SECONDS,
-                data={
-                    "chat_id":    sent.chat_id,
-                    "message_id": sent.message_id,
-                    "user_id":    user.id,
-                },
-                name=f"expire_{user.id}",
-            )
-
         else:
             logger.info("❌ Akses DITOLAK user %s (status: %s)", user.id, member.status)
-            keyboard = [
-                [InlineKeyboardButton("📌 Join Grup", url=GROUP_LINK)],
-            ]
+            keyboard = [[InlineKeyboardButton("📌 Join Grup", url=GROUP_LINK)]]
             await update.message.reply_text(
-                "❌ Kamu belum join grup\\!\n\n"
-                "Join dulu lewat bot: /join di private chat\\.",
-                parse_mode="MarkdownV2",
+                "❌ Kamu belum join grup!\n\n"
+                "Chat bot secara pribadi dan ketik /start untuk link join.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
     except Forbidden:
-        await update.message.reply_text("⚠️ Bot bukan admin grup\\. Hubungi admin\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Bot bukan admin grup. Hubungi admin.")
     except BadRequest as e:
         logger.error("BadRequest: %s", e)
-        await update.message.reply_text("⚠️ Gagal memverifikasi\\. Coba lagi\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Gagal memverifikasi. Coba lagi.")
     except TelegramError as e:
         logger.error("TelegramError: %s", e)
-        await update.message.reply_text("⚠️ Error Telegram\\. Coba lagi\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Error Telegram. Coba lagi.")
 
 # ============================================================
-# JOB: Expire menu channel setelah 5 menit
+# GRUP — Callback tombol "Akses Channel" dari welcome message
 # ============================================================
-async def expire_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data       = context.job.data
-    chat_id    = data["chat_id"]
-    message_id = data["message_id"]
-    user_id    = data["user_id"]
-    channel_menu_time.pop(user_id, None)
+async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user  = query.from_user
+    await query.answer()
+
+    if is_rate_limited(user.id):
+        await query.answer("⏳ Terlalu sering. Tunggu sebentar.", show_alert=True)
+        return
 
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=(
-                "⌛ *Menu channel sudah kadaluarsa\\.*\n\n"
-                "Ketik /akses di grup untuk mendapatkan akses baru\\."
-            ),
-            parse_mode="MarkdownV2",
-        )
-        logger.info("Menu channel user %s sudah expired", user_id)
+        member = await context.bot.get_chat_member(GROUP_ID, user.id)
+
+        if member.status in ("member", "administrator", "creator"):
+            logger.info("✅ Akses welcome DIBERIKAN ke user %s", user.id)
+            await send_channel_menu(
+                context=context,
+                chat_id=query.message.chat_id,
+                user_id=user.id,
+            )
+        else:
+            await query.answer("❌ Kamu belum join grup!", show_alert=True)
+
     except TelegramError as e:
-        logger.warning("Gagal expire menu user %s: %s", user_id, e)
+        logger.error("TelegramError welcome callback: %s", e)
+        await query.answer("⚠️ Error. Coba lagi.", show_alert=True)
 
 # ============================================================
-# GRUP — Welcome member baru (dengan gambar)
+# GRUP — Welcome member baru
 # ============================================================
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = extract_status_change(update.chat_member)
@@ -302,74 +329,19 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error("Gagal kirim welcome message: %s", e)
 
 # ============================================================
-# GRUP — Callback tombol "Akses Channel" dari welcome message
-# ============================================================
-async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback tombol akses dari pesan welcome di grup."""
-    query = update.callback_query
-    user  = query.from_user
-    await query.answer()
-
-    if is_rate_limited(user.id):
-        await query.answer("⏳ Terlalu sering. Tunggu sebentar.", show_alert=True)
-        return
-
-    try:
-        member = await context.bot.get_chat_member(GROUP_ID, user.id)
-
-        if member.status in ("member", "administrator", "creator"):
-            logger.info("✅ Akses welcome DIBERIKAN ke user %s", user.id)
-            channel_menu_time[user.id] = time.time()
-
-            keyboard = [
-                [InlineKeyboardButton(name, url=link)]
-                for name, link in CHANNELS.items()
-            ]
-            await query.message.reply_text(
-                "✅ Akses diberikan\\! Pilih channel:\n\n"
-                "⏳ Menu ini aktif selama *5 menit*\\.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="MarkdownV2",
-            )
-
-            sent = query.message
-
-            old_jobs = context.job_queue.get_jobs_by_name(f"expire_{user.id}")
-            for job in old_jobs:
-                job.schedule_removal()
-
-            context.job_queue.run_once(
-                expire_menu,
-                when=MENU_EXPIRE_SECONDS,
-                data={
-                    "chat_id":    sent.chat_id,
-                    "message_id": sent.message_id,
-                    "user_id":    user.id,
-                },
-                name=f"expire_{user.id}",
-            )
-        else:
-            await query.answer("❌ Kamu belum join grup!", show_alert=True)
-
-    except TelegramError as e:
-        logger.error("TelegramError welcome callback: %s", e)
-        await query.answer("⚠️ Error. Coba lagi.", show_alert=True)
-
-# ============================================================
 # PRIVATE CHAT — /getfileid (admin)
 # ============================================================
 async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         return
 
     context.user_data["waiting_photo"] = True
     await update.message.reply_text(
-        "📸 Silakan kirim foto yang ingin dijadikan gambar welcome\\.\n\n"
-        "Bot akan membalas dengan `file_id` foto tersebut\\.",
-        parse_mode="MarkdownV2",
+        "📸 Silakan kirim foto yang ingin dijadikan gambar welcome.\n\n"
+        "Bot akan membalas dengan `file_id` foto tersebut.",
+        parse_mode="Markdown",
     )
 
 # ============================================================
@@ -378,8 +350,7 @@ async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         return
     if not context.user_data.get("waiting_photo"):
         return
@@ -400,7 +371,7 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"4\\. Klik Deploy\\!",
         parse_mode="MarkdownV2",
     )
-    logger.info("Admin %s mengambil file_id: %s", user.id, file_id)
+    logger.info("Admin mengambil file_id: %s", file_id)
 
 # ============================================================
 # PRIVATE CHAT — /id (admin)
@@ -408,13 +379,11 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         return
-    chat = update.effective_chat
     await update.message.reply_text(
-        f"👤 *User ID kamu* : `{user.id}`\n"
-        f"💬 *Chat ID sekarang* : `{chat.id}`",
+        f"👤 *User ID kamu* : `{update.effective_user.id}`\n"
+        f"💬 *Chat ID sekarang* : `{update.effective_chat.id}`",
         parse_mode="Markdown",
     )
 
@@ -424,8 +393,7 @@ async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         return
     try:
         chat = await context.bot.get_chat(GROUP_ID)
@@ -458,15 +426,14 @@ def main() -> None:
         .build()
     )
 
-    # ── PRIVATE CHAT handlers ──────────────────────────────
-    app.add_handler(CommandHandler("start",      start,      filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("join",       join,       filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("id",         get_id,     filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("status",     status,     filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("getfileid",  get_file_id,filters=filters.ChatType.PRIVATE))
+    # ── PRIVATE CHAT ───────────────────────────────────────
+    app.add_handler(CommandHandler("start",      start,       filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("id",         get_id,      filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("status",     status,      filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("getfileid",  get_file_id, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, receive_photo))
 
-    # ── GRUP handlers ──────────────────────────────────────
+    # ── GRUP ───────────────────────────────────────────────
     app.add_handler(CommandHandler("akses", akses, filters=filters.ChatType.GROUPS))
     app.add_handler(CallbackQueryHandler(akses_welcome_callback, pattern="^akses_welcome$"))
     app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
