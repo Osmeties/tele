@@ -283,6 +283,12 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user = update.chat_member.new_chat_member.user
     chat = update.effective_chat
+
+    # Hanya proses update dari grup yang benar, bukan channel linked
+    if chat.id != GROUP_ID:
+        logger.info("Abaikan update dari chat %s (bukan grup utama)", chat.id)
+        return
+
     logger.info("Member baru join: %s (@%s)", user.id, user.username)
 
     # Gunakan HTML agar lebih aman dari karakter spesial
