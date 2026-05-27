@@ -4,10 +4,10 @@ Telegram Gate Bot - Full Secure Version
 Fitur:
 - PRIVATE CHAT : /start → tombol join grup
 - GRUP         : /akses → cek keanggotaan & menu channel (expire 5 menit, otomatis terhapus)
+- Auto-delete pesan dengan kata terlarang (tanpa warn/kick)
 - Welcome message + gambar saat member baru join grup
 - /getfileid   → admin ambil file_id gambar (private chat)
 - Rate limiting per user (5 request / 60 detik)
-- Menu channel otomatis TERHAPUS setelah 5 menit
 - Logging lengkap (terminal + file)
 - Error handling spesifik
 - Admin-only commands (/id, /status, /getfileid)
@@ -15,6 +15,7 @@ Fitur:
 """
 
 import os
+import re
 import logging
 import time
 from collections import defaultdict
@@ -37,7 +38,7 @@ from telegram.error import Forbidden, BadRequest, TelegramError
 TOKEN           = os.getenv("BOT_TOKEN")
 GROUP_ID        = int(os.getenv("GROUP_ID", "0"))
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
-GROUP_LINK      = os.getenv("GROUP_LINK", "https://t.me/+5uw96pDwyzphMjhh")
+GROUP_LINK      = os.getenv("GROUP_LINK", "https://t.me/testingwjr")
 WELCOME_FILE_ID = os.getenv("WELCOME_FILE_ID", "")
 
 if not TOKEN:
@@ -56,10 +57,88 @@ CHANNELS: dict[str, str] = {
 }
 
 # ============================================================
+# KATA TERLARANG
+# ============================================================
+BANNED_WORDS = [
+    "bokep","bkp","b0kep","b0k3p","porno","porn","p0rn","pornhub",
+    "xnxx","xvideos","xvideo","redtube","youporn","jav","hentai",
+    "doujin","ecchi","ahegao","nsfw","sex","seks","s3x","ngewe",
+    "ngentot","ngntt","ng3nt0t","entot","ewean","memek","mmk","m3m3k",
+    "kontol","kntl","k0nt0l","titit","ttt","penis","vagina","puki",
+    "pukimak","pepek","toket","tete","tetek","payudara","boobs","nude",
+    "bugil","telanjang","horny","sange","s4ng3","coli","colianku",
+    "colmek","masturbasi","masturbate","onani","blowjob","bj","handjob",
+    "hj","deepthroat","threesome","gangbang","anal","analsex","oral",
+    "oralsex","milf","gilf","bdsm","fetish","crot","cum","cumming",
+    "creampie","facial","fingering","petting","virgin","perawan",
+    "jilboobs","jilmek","jilbabbugil","openbo","openbooking","bookingan",
+    "openvc","vcbugil","livecolmek","camsex","camslut","camgirl",
+    "camshow","onlyfans","ofans","stripper","striptease","lesbi",
+    "lesbian","gaysex","bisex","transsex","shemale","tranny","pelacur",
+    "lonte","perek","jablay","bohay","semok","toketgede","toketmontok",
+    "ngocok","sepong","diwe","ngews","ewe","cabul","mesum","birahi",
+    "birahian","bokongan","pantatmulus","pantatmontok","toketmulus",
+    "kimcil","abgbugil","abgbokep","animehentai","bokepindo","bokepjepang",
+    "bokepbarat","bokepviral","bokepterbaru","bokepremaja","bokepstreaming",
+    "sexchat","sexcall","sexcam","sexvideo","sexmovie","sexstream",
+    "adultvideo","adultchat","adultonly","r18","xxx","xxnx","xnx","xvid",
+    "hotgirl","hotboy","hotmom","cewekbo","cewekopenbo","cowokgay",
+    "cewekcoli","ceweksange","cowoksange","sangean","sangeberat","gairah",
+    "nafsu","nafsubesar","ngaceng","ereksi","peju","sperma","mani",
+    "vcsange","vctetek","vcporno","vcmesum","paptt","papkontol","papmemek",
+    "sendnude","sendbokep","kirimbugil","openmichat","michatbo",
+    "michatopenbo","escort","escorts","callgirl","cewekbispak","bispak",
+    "ayamkampus","simpanan","jablaymurahan","pecun","ngeseks",
+    "seksbebas","freesex","swinger","swingers","orgy","orgasm","orgasme",
+    "moaning","desahan","desah","lendir","smean","colbar","colmekbareng",
+    "ewebareng","gay","lesby","lesbong","bencong","banci","waria",
+    "transeksual","shemaleporn","trannyporn","bokepanime","bokep3gp",
+    "bokephd","bokep4k","bokepgratis","downloadbokep","linkbokep",
+    "linkviral","linkmesum","link18","linkdewasa","kontensex",
+    "kontendewasa","videomesum","videobokep","videoporno","filmdewasa",
+    "filmsemi","semi","abgngentot","memekbasah","kontolbesar","toketbesar",
+    "ngentotmemek","ngentotkontol","kontolhitam","memekpink","susugede",
+    "tetekgede","tetekmontok","cewekbinal","cowokbirahi","wanitasange",
+    "priasange","bokepjilbab","jilboob","ngocokbareng","ngewebareng",
+    "colmekrame","sexparty","partysex","adultparty","adultgroup",
+    "adultcontent","bokeptelegram","grupbokep","channelbokep",
+    "videoviral18","mesumviral","bokepviralindo","cewekbugil","cowokbugil",
+    "bugillive","livebugil","bugilindo","bugiljepang","bugilkorea",
+    "bugilbarat","openboindo","openbomurah","openbovip","realescort",
+    "escortindo","escortmurah","ngentotkeras","sexkeras","hardcore",
+    "softcore","softporn","hardporn","pornografi","pornographic",
+    "adultsite","adultweb","adultforum","adultgram","bokepgroup",
+    "bokepchannel","pornchannel","pornsite","sexsite","sexforum",
+    "pornforum","livesex","liveporn","pornlive","videocoli","videocrot",
+    "videohentai","hentaivideo","hentaiporn","animeporno","animebugil",
+    "doujin18","javuncensored","uncensored","javhd","javsubindo","javindo",
+    "javstream","javdownload","pornindo","pornjepang","pornbarat",
+    "pornkorea","pornthai","sexindo","sexjepang","sexbarat","sexviral",
+    "linkngentot","linksex","linkporn","linkhentai","linkjav","grupmesum",
+    "grupdewasa","grup18","grouporn","groupsex","groupmesum","cewekbokep",
+    "cowokbokep","bugilviral","viral18","viralbokep","viralporno",
+    "ngewekeras","toketseksi","pantatseksi","cewekseksi","cowokseksi",
+    "cewekganjen","cowokmesum","nafsuan","sangetotal","openvcsange",
+    "vccoli","vcpap","papbugil","papbokep","papmesum","papnude",
+    "sendnudes","jualbokep","jualvideo","jualkonten","jualonlyfans",
+    "jualvc","jualpap","jualbugil","jualmesum","jualporno",
+    "jualakunonlyfans","pecunthai","di entot","colisetiap hari",
+    "colbar yuk","vcdong","papdong","papttdong",
+]
+
+# Buat regex pattern sekali saja saat startup
+_BANNED_PATTERN = re.compile(
+    r"(?<![a-z0-9])(" +
+    "|".join(re.escape(w) for w in sorted(BANNED_WORDS, key=len, reverse=True)) +
+    r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+# ============================================================
 # KONSTANTA
 # ============================================================
 RATE_LIMIT          = 5
-RATE_WINDOW         = 60   # detik
+RATE_WINDOW         = 60
 MENU_EXPIRE_SECONDS = 300  # 5 menit
 
 # ============================================================
@@ -95,12 +174,58 @@ def is_rate_limited(user_id: int) -> bool:
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
+def contains_banned_word(text: str) -> bool:
+    return bool(_BANNED_PATTERN.search(text))
+
 def extract_status_change(chat_member_update: ChatMemberUpdated):
     old_status = chat_member_update.old_chat_member.status
     new_status = chat_member_update.new_chat_member.status
     was_member = old_status in ("member", "administrator", "creator", "restricted")
     is_member  = new_status in ("member", "administrator", "creator", "restricted")
     return was_member, is_member
+
+# ============================================================
+# GRUP — Filter pesan kata terlarang (delete only)
+# ============================================================
+async def filter_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-delete pesan yang mengandung kata terlarang. Tanpa warn/kick."""
+    msg = update.message or update.edited_message
+    if not msg:
+        return
+
+    # Hanya proses pesan di grup utama
+    if msg.chat.id != GROUP_ID:
+        return
+
+    # Ambil teks atau caption
+    text = msg.text or msg.caption or ""
+    if not text:
+        return
+
+    # Admin grup bebas dari filter
+    user = msg.from_user
+    if not user:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(GROUP_ID, user.id)
+        if member.status in ("administrator", "creator"):
+            return
+    except TelegramError:
+        pass
+
+    if not contains_banned_word(text):
+        return
+
+    # Hapus pesan diam-diam (tanpa notifikasi apapun)
+    try:
+        await msg.delete()
+        logger.info(
+            "Pesan dihapus dari user %s (@%s) | teks: %s",
+            user.id, user.username, text[:60]
+        )
+    except TelegramError as e:
+        logger.warning("Gagal hapus pesan dari user %s: %s", user.id, e)
 
 # ============================================================
 # JOB: Expire menu — hapus pesan otomatis setelah 5 menit
@@ -111,13 +236,8 @@ async def expire_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
     message_id = data["message_id"]
     user_id    = data["user_id"]
 
-    logger.info("Expire menu untuk user %s", user_id)
-
     try:
-        await context.bot.delete_message(
-            chat_id=chat_id,
-            message_id=message_id,
-        )
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         logger.info("Menu channel user %s berhasil dihapus", user_id)
     except TelegramError:
         try:
@@ -138,7 +258,6 @@ async def send_channel_menu(
     user_id: int,
     reply_to_message_id: int | None = None,
 ) -> None:
-    # Batalkan job expire lama kalau ada
     old_jobs = context.job_queue.get_jobs_by_name(f"expire_{user_id}")
     for job in old_jobs:
         job.schedule_removal()
@@ -161,15 +280,10 @@ async def send_channel_menu(
     context.job_queue.run_once(
         expire_menu,
         when=MENU_EXPIRE_SECONDS,
-        data={
-            "chat_id":    sent.chat_id,
-            "message_id": sent.message_id,
-            "user_id":    user_id,
-        },
+        data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user_id},
         name=f"expire_{user_id}",
     )
-
-    logger.info("Menu channel dikirim ke user %s, expire dalam %ds", user_id, MENU_EXPIRE_SECONDS)
+    logger.info("Menu channel dikirim ke user %s", user_id)
 
 # ============================================================
 # PRIVATE CHAT — /start
@@ -185,9 +299,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⏳ Terlalu banyak permintaan. Coba lagi nanti.")
         return
 
-    keyboard = [
-        [InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)],
-    ]
+    keyboard = [[InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)]]
     await update.message.reply_text(
         "👋 Halo! Selamat datang di bot Warkop Jam Rawan!\n\n"
         "⚠️ Kamu harus join grup dulu sebelum bisa akses channel.\n\n"
@@ -223,7 +335,6 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_to_message_id=update.message.message_id,
             )
         else:
-            logger.info("Akses DITOLAK user %s (status: %s)", user.id, member.status)
             keyboard = [[InlineKeyboardButton("📌 Join Grup", url=GROUP_LINK)]]
             await update.message.reply_text(
                 "❌ Kamu belum join grup!\n\n"
@@ -254,17 +365,10 @@ async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
-
         if member.status in ("member", "administrator", "creator"):
-            logger.info("Akses welcome DIBERIKAN ke user %s", user.id)
-            await send_channel_menu(
-                context=context,
-                chat_id=query.message.chat_id,
-                user_id=user.id,
-            )
+            await send_channel_menu(context=context, chat_id=query.message.chat_id, user_id=user.id)
         else:
             await query.answer("❌ Kamu belum join grup!", show_alert=True)
-
     except TelegramError as e:
         logger.error("TelegramError welcome callback: %s", e)
         await query.answer("⚠️ Error. Coba lagi.", show_alert=True)
@@ -284,16 +388,14 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.chat_member.new_chat_member.user
     chat = update.effective_chat
 
-    # Hanya proses update dari grup yang benar, bukan channel linked
+    # Hanya proses dari grup utama, bukan linked channel
     if chat.id != GROUP_ID:
         logger.info("Abaikan update dari chat %s (bukan grup utama)", chat.id)
         return
 
     logger.info("Member baru join: %s (@%s)", user.id, user.username)
 
-    # Gunakan HTML agar lebih aman dari karakter spesial
     mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-
     welcome_text = (
         f"Selamat Datang {mention}! 👋\n\n"
         "WELCOME TO WARKOP JAM RAWAN\n"
@@ -308,24 +410,19 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Akses Channel", callback_data="akses_welcome")],
+        [InlineKeyboardButton("🚀 Akses Channel", callback_data="akses_welcome")]
     ])
 
     try:
         if WELCOME_FILE_ID:
             await context.bot.send_photo(
-                chat_id=chat.id,
-                photo=WELCOME_FILE_ID,
-                caption=welcome_text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
+                chat_id=chat.id, photo=WELCOME_FILE_ID,
+                caption=welcome_text, parse_mode="HTML", reply_markup=keyboard,
             )
         else:
             await context.bot.send_message(
-                chat_id=chat.id,
-                text=welcome_text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
+                chat_id=chat.id, text=welcome_text,
+                parse_mode="HTML", reply_markup=keyboard,
             )
     except TelegramError as e:
         logger.error("Gagal kirim welcome message: %s", e)
@@ -334,42 +431,33 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # PRIVATE CHAT — /getfileid (admin)
 # ============================================================
 async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
         return
-    if not is_admin(update.effective_user.id):
-        return
-
     context.user_data["waiting_photo"] = True
     await update.message.reply_text(
-        "📸 Silakan kirim foto yang ingin dijadikan gambar welcome.\n\n"
-        "Bot akan membalas dengan file_id foto tersebut.",
+        "📸 Silakan kirim foto yang ingin dijadikan gambar welcome.\n"
+        "Bot akan membalas dengan file_id foto tersebut."
     )
 
 # ============================================================
 # PRIVATE CHAT — Terima foto dari admin
 # ============================================================
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return
-    if not is_admin(update.effective_user.id):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
         return
     if not context.user_data.get("waiting_photo"):
         return
 
-    photo   = update.message.photo[-1]
-    file_id = photo.file_id
+    file_id = update.message.photo[-1].file_id
     context.user_data["waiting_photo"] = False
 
     await update.message.reply_text(
-        f"✅ File ID foto kamu:\n\n"
-        f"{file_id}\n\n"
+        f"✅ File ID foto kamu:\n\n{file_id}\n\n"
         f"Cara pakai:\n"
         f"1. Copy file_id di atas\n"
         f"2. Buka Railway Dashboard → Variables\n"
-        f"3. Tambahkan:\n"
-        f"   Key: WELCOME_FILE_ID\n"
-        f"   Value: (paste file_id)\n"
-        f"4. Klik Deploy!",
+        f"3. Key: WELCOME_FILE_ID | Value: (paste file_id)\n"
+        f"4. Klik Deploy!"
     )
     logger.info("Admin mengambil file_id: %s", file_id)
 
@@ -377,22 +465,18 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # PRIVATE CHAT — /id (admin)
 # ============================================================
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return
-    if not is_admin(update.effective_user.id):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        f"User ID kamu   : {update.effective_user.id}\n"
-        f"Chat ID sekarang: {update.effective_chat.id}",
+        f"User ID kamu    : {update.effective_user.id}\n"
+        f"Chat ID sekarang: {update.effective_chat.id}"
     )
 
 # ============================================================
 # PRIVATE CHAT — /status (admin)
 # ============================================================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return
-    if not is_admin(update.effective_user.id):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
         return
     try:
         chat = await context.bot.get_chat(GROUP_ID)
@@ -401,7 +485,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"✅ Bot terhubung ke grup:\n"
             f"Nama   : {chat.title}\n"
             f"ID     : {chat.id}\n"
-            f"Status : {me.status}",
+            f"Status : {me.status}"
         )
     except TelegramError as e:
         await update.message.reply_text(f"❌ Gagal cek grup: {e}")
@@ -418,23 +502,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     logger.info("Bot dimulai...")
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
+    app = ApplicationBuilder().token(TOKEN).build()
 
     # ── PRIVATE CHAT ───────────────────────────────────────
-    app.add_handler(CommandHandler("start",      start,       filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("id",         get_id,      filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("status",     status,      filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("getfileid",  get_file_id, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("start",     start,       filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("id",        get_id,      filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("status",    status,      filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("getfileid", get_file_id, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, receive_photo))
 
     # ── GRUP ───────────────────────────────────────────────
     app.add_handler(CommandHandler("akses", akses, filters=filters.ChatType.GROUPS))
     app.add_handler(CallbackQueryHandler(akses_welcome_callback, pattern="^akses_welcome$"))
     app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
+
+    # Filter kata terlarang — teks biasa dan caption (foto/video)
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.CAPTION) & filters.ChatType.GROUPS,
+        filter_banned_words
+    ))
 
     app.add_error_handler(error_handler)
 
