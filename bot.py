@@ -345,7 +345,7 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
 
-        if member.status in ("member", "administrator", "creator"):
+        if member.status in ("member", "administrator", "creator", "restricted"):
             logger.info("Akses DIBERIKAN ke user %s", user.id)
             await send_channel_menu(
                 context=context,
@@ -384,7 +384,7 @@ async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
-        if member.status in ("member", "administrator", "creator"):
+        if member.status in ("member", "administrator", "creator", "restricted"):
             await send_channel_menu(context=context, chat_id=query.message.chat_id, user_id=user.id)
         else:
             await query.answer("❌ Kamu belum join grup!", show_alert=True)
