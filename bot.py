@@ -137,9 +137,10 @@ _BANNED_PATTERN = re.compile(
 # ============================================================
 # KONSTANTA
 # ============================================================
-RATE_LIMIT          = 5
-RATE_WINDOW         = 60
-MENU_EXPIRE_SECONDS = 300  # 5 menit
+RATE_LIMIT             = 5
+RATE_WINDOW            = 60
+MENU_EXPIRE_SECONDS    = 300   # 5 menit
+WELCOME_DELETE_SECONDS = 1800  # 30 menit
 
 # ============================================================
 # LOGGING
@@ -250,6 +251,21 @@ async def expire_menu(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Gagal expire menu user %s: %s", user_id, e)
 
 # ============================================================
+# JOB: Auto-delete welcome message setelah 30 menit
+# ============================================================
+async def expire_welcome(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data       = context.job.data
+    chat_id    = data["chat_id"]
+    message_id = data["message_id"]
+    user_id    = data["user_id"]
+
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info("Welcome message user %s berhasil dihapus (30 menit)", user_id)
+    except TelegramError as e:
+        logger.warning("Gagal hapus welcome message user %s: %s", user_id, e)
+
+# ============================================================
 # HELPER: Kirim menu channel + jadwalkan expire
 # ============================================================
 async def send_channel_menu(
@@ -277,12 +293,15 @@ async def send_channel_menu(
         reply_to_message_id=reply_to_message_id,
     )
 
-    context.job_queue.run_once(
-        expire_menu,
-        when=MENU_EXPIRE_SECONDS,
-        data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user_id},
-        name=f"expire_{user_id}",
-    )
+    if context.job_queue is None:
+        logger.error("job_queue tidak aktif! Pastikan APScheduler terinstall: pip install 'python-telegram-bot[job-queue]'")
+    else:
+        context.job_queue.run_once(
+            expire_menu,
+            when=MENU_EXPIRE_SECONDS,
+            data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user_id},
+            name=f"expire_{user_id}",
+        )
     logger.info("Menu channel dikirim ke user %s", user_id)
 
 # ============================================================
@@ -415,15 +434,27 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         if WELCOME_FILE_ID:
-            await context.bot.send_photo(
+            sent = await context.bot.send_photo(
                 chat_id=chat.id, photo=WELCOME_FILE_ID,
                 caption=welcome_text, parse_mode="HTML", reply_markup=keyboard,
             )
         else:
-            await context.bot.send_message(
+            sent = await context.bot.send_message(
                 chat_id=chat.id, text=welcome_text,
                 parse_mode="HTML", reply_markup=keyboard,
             )
+
+        # Jadwalkan auto-delete welcome message setelah 30 menit
+        if context.job_queue is None:
+            logger.error("job_queue tidak aktif! Pastikan APScheduler terinstall.")
+        else:
+            context.job_queue.run_once(
+                expire_welcome,
+                when=WELCOME_DELETE_SECONDS,
+                data={"chat_id": chat.id, "message_id": sent.message_id, "user_id": user.id},
+                name=f"expire_welcome_{user.id}",
+            )
+        logger.info("Welcome message dikirim ke user %s, akan dihapus dalam 30 menit", user.id)
     except TelegramError as e:
         logger.error("Gagal kirim welcome message: %s", e)
 
@@ -503,6 +534,14 @@ def main() -> None:
     logger.info("Bot dimulai...")
 
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # Validasi job_queue aktif saat startup
+    if app.job_queue is None:
+        raise RuntimeError(
+            "job_queue tidak aktif! "
+            "Jalankan: pip install 'python-telegram-bot[job-queue]'"
+        )
+    logger.info("job_queue aktif ✓")
 
     # ── PRIVATE CHAT ───────────────────────────────────────
     app.add_handler(CommandHandler("start",     start,       filters=filters.ChatType.PRIVATE))
