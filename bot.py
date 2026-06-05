@@ -140,7 +140,7 @@ _BANNED_PATTERN = re.compile(
 RATE_LIMIT             = 5
 RATE_WINDOW            = 60
 MENU_EXPIRE_SECONDS    = 300   # 5 menit
-WELCOME_DELETE_SECONDS = 1800  # 30 menit
+WELCOME_DELETE_SECONDS = 60    # 1 menit
 
 # ============================================================
 # LOGGING
@@ -355,7 +355,6 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
-        logger.info("DEBUG: chat.id=%s, GROUP_ID=%s, user=%s, status=%s", update.effective_chat.id, GROUP_ID, user.id, member.status)
 
         if member.status in ("member", "administrator", "creator", "restricted"):
             logger.info("Akses DIBERIKAN ke user %s", user.id)
