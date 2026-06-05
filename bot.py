@@ -338,12 +338,24 @@ async def akses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info("/akses dari user %s (@%s)", user.id, user.username)
 
+    # Anonymous admin (GroupAnonymousBot) — langsung beri akses
+    ANONYMOUS_ADMIN_ID = 1087968824
+    if user.id == ANONYMOUS_ADMIN_ID:
+        await send_channel_menu(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=user.id,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
     if is_rate_limited(user.id):
         await update.message.reply_text("⏳ Terlalu banyak permintaan. Coba lagi nanti.")
         return
 
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user.id)
+        logger.info("DEBUG: chat.id=%s, GROUP_ID=%s, user=%s, status=%s", update.effective_chat.id, GROUP_ID, user.id, member.status)
 
         if member.status in ("member", "administrator", "creator", "restricted"):
             logger.info("Akses DIBERIKAN ke user %s", user.id)
