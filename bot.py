@@ -141,6 +141,8 @@ RATE_LIMIT             = 5
 RATE_WINDOW            = 60
 MENU_EXPIRE_SECONDS    = 300   # 5 menit
 WELCOME_DELETE_SECONDS = 60    # 1 menit
+BROADCAST_INTERVAL     = 3 * 60 * 60  # 3 jam (detik)
+BROADCAST_FIRST_DELAY  = 60           # jeda pertama setelah bot start (detik)
 
 # ============================================================
 # LOGGING
@@ -159,6 +161,7 @@ logger = logging.getLogger(__name__)
 # STORAGE
 # ============================================================
 _rate_store: dict[int, list[float]] = defaultdict(list)
+_last_broadcast_message_id: int | None = None
 
 # ============================================================
 # HELPERS
@@ -264,6 +267,43 @@ async def expire_welcome(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Welcome message user %s berhasil dihapus (30 menit)", user_id)
     except TelegramError as e:
         logger.warning("Gagal hapus welcome message user %s: %s", user_id, e)
+
+# ============================================================
+# JOB: Broadcast berkala (setiap 3 jam) ke grup → arahkan ke channel nonton
+# ============================================================
+async def broadcast_channels(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _last_broadcast_message_id
+
+    # Hapus broadcast lama biar grup tidak penuh spam pesan yang sama
+    if _last_broadcast_message_id is not None:
+        try:
+            await context.bot.delete_message(chat_id=GROUP_ID, message_id=_last_broadcast_message_id)
+        except TelegramError:
+            pass  # mungkin sudah dihapus manual / kadaluarsa, abaikan
+
+    keyboard = [
+        [InlineKeyboardButton(name, url=link)]
+        for name, link in CHANNELS.items()
+    ]
+    keyboard.append([InlineKeyboardButton("🚀 Cek Akses (/akses)", callback_data="akses_welcome")])
+
+    text = (
+        "🔥 𝗧𝗘𝗠𝗣𝗔𝗧 𝗞𝗛𝗨𝗦𝗨𝗦 𝟭𝟴+ 🔥\n\n"
+        "Konten terupdate, gratis tinggal nonton!\n"
+        "Klik salah satu channel di bawah ini 👇\n\n"
+        "Belum punya akses? Ketik /akses di grup ini."
+    )
+
+    try:
+        sent = await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        _last_broadcast_message_id = sent.message_id
+        logger.info("Broadcast channel terkirim, message_id=%s", sent.message_id)
+    except TelegramError as e:
+        logger.error("Gagal kirim broadcast: %s", e)
 
 # ============================================================
 # HELPER: Kirim menu channel + jadwalkan expire
@@ -553,6 +593,15 @@ def main() -> None:
             "Jalankan: pip install 'python-telegram-bot[job-queue]'"
         )
     logger.info("job_queue aktif ✓")
+
+    # Jadwalkan broadcast berkala ke grup (setiap 3 jam)
+    app.job_queue.run_repeating(
+        broadcast_channels,
+        interval=BROADCAST_INTERVAL,
+        first=BROADCAST_FIRST_DELAY,
+        name="broadcast_channels",
+    )
+    logger.info("Broadcast berkala dijadwalkan setiap %s detik", BROADCAST_INTERVAL)
 
     # ── PRIVATE CHAT ───────────────────────────────────────
     app.add_handler(CommandHandler("start",     start,       filters=filters.ChatType.PRIVATE))
