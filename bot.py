@@ -20,7 +20,7 @@ import logging
 import time
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, ChatPermissions
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -47,7 +47,7 @@ if GROUP_ID == 0:
     raise EnvironmentError("GROUP_ID tidak ditemukan!")
 
 # ============================================================
-# CHANNELS
+# CHANNELS (link untuk tombol)
 # ============================================================
 CHANNELS: dict[str, str] = {
     "Indo 🎬":    os.getenv("CH_INDO",    "https://t.me/channel_indo"),
@@ -55,6 +55,19 @@ CHANNELS: dict[str, str] = {
     "Random 🎲":  os.getenv("CH_RANDOM",  "https://t.me/channel_random"),
     "Cosplay 👗": os.getenv("CH_COSPLAY", "https://t.me/channel_cosplay"),
 }
+
+# ============================================================
+# CHANNEL IDS (untuk cek keanggotaan — channel private wajib pakai ID numerik,
+# format: -100xxxxxxxxxx. Ambil dengan forward 1 pesan dari channel ke @userinfobot)
+# ============================================================
+CHANNEL_IDS: dict[str, int] = {
+    "Indo 🎬":    int(os.getenv("CH_INDO_ID",    "0")),
+    "Japan 🎌":   int(os.getenv("CH_JAPAN_ID",   "0")),
+    "Random 🎲":  int(os.getenv("CH_RANDOM_ID",  "0")),
+    "Cosplay 👗": int(os.getenv("CH_COSPLAY_ID", "0")),
+}
+
+_missing_channel_ids = [name for name, cid in CHANNEL_IDS.items() if cid == 0]
 
 # ============================================================
 # KATA TERLARANG
@@ -140,7 +153,7 @@ _BANNED_PATTERN = re.compile(
 RATE_LIMIT             = 5
 RATE_WINDOW            = 60
 MENU_EXPIRE_SECONDS    = 300   # 5 menit
-WELCOME_DELETE_SECONDS = 60    # 1 menit
+WELCOME_DELETE_SECONDS = 900   # 15 menit (waktu untuk user join 4 channel & verifikasi)
 BROADCAST_INTERVAL     = 3 * 60 * 60  # 3 jam (detik)
 BROADCAST_FIRST_DELAY  = 60           # jeda pertama setelah bot start (detik)
 
@@ -156,6 +169,12 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+if _missing_channel_ids:
+    logger.warning(
+        "CHANNEL_IDS belum lengkap, verifikasi join channel tidak akan akurat untuk: %s",
+        ", ".join(_missing_channel_ids),
+    )
 
 # ============================================================
 # STORAGE
@@ -187,6 +206,55 @@ def extract_status_change(chat_member_update: ChatMemberUpdated):
     was_member = old_status in ("member", "administrator", "creator", "restricted")
     is_member  = new_status in ("member", "administrator", "creator", "restricted")
     return was_member, is_member
+
+async def get_unjoined_channels(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[str]:
+    """Cek user sudah join channel mana saja. Return list nama channel yang BELUM dijoin."""
+    unjoined = []
+    for name, chat_id in CHANNEL_IDS.items():
+        if chat_id == 0:
+            # ID belum dikonfigurasi, skip cek (anggap lolos supaya tidak menghalangi semua orang)
+            continue
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status not in ("member", "administrator", "creator", "restricted"):
+                unjoined.append(name)
+        except TelegramError as e:
+            logger.warning("Gagal cek member di channel %s untuk user %s: %s", name, user_id, e)
+            unjoined.append(name)
+    return unjoined
+
+async def mute_user_in_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=GROUP_ID,
+            user_id=user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+        )
+        logger.info("User %s di-mute sementara (belum verifikasi join channel)", user_id)
+    except TelegramError as e:
+        logger.warning("Gagal mute user %s: %s", user_id, e)
+
+async def unmute_user_in_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=GROUP_ID,
+            user_id=user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+        logger.info("User %s di-unmute, verifikasi join channel berhasil", user_id)
+    except TelegramError as e:
+        logger.warning("Gagal unmute user %s: %s", user_id, e)
 
 # ============================================================
 # GRUP — Filter pesan kata terlarang (delete only)
@@ -444,6 +512,43 @@ async def akses_welcome_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("⚠️ Error. Coba lagi.", show_alert=True)
 
 # ============================================================
+# GRUP — Callback tombol "Saya Sudah Join Semua" dari welcome message
+# ============================================================
+async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    clicker = query.from_user
+
+    # Pastikan tombol hanya bisa dipakai oleh user yang bersangkutan
+    try:
+        target_user_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        target_user_id = clicker.id
+
+    if clicker.id != target_user_id:
+        await query.answer("⚠️ Tombol ini bukan untukmu.", show_alert=True)
+        return
+
+    if is_rate_limited(clicker.id):
+        await query.answer("⏳ Terlalu sering. Tunggu sebentar.", show_alert=True)
+        return
+
+    await query.answer("🔍 Mengecek keanggotaan channel...")
+
+    unjoined = await get_unjoined_channels(context, clicker.id)
+
+    if unjoined:
+        names = ", ".join(unjoined)
+        await query.answer(
+            f"❌ Kamu belum join: {names}\n\nJoin dulu semua channel, lalu klik tombol ini lagi.",
+            show_alert=True,
+        )
+        return
+
+    await unmute_user_in_group(context, clicker.id)
+    await query.answer("✅ Verifikasi berhasil! Sekarang kamu bisa chat di grup.", show_alert=True)
+    logger.info("User %s berhasil verifikasi join semua channel", clicker.id)
+
+# ============================================================
 # GRUP — Welcome member baru
 # ============================================================
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -465,6 +570,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     logger.info("Member baru join: %s (@%s)", user.id, user.username)
 
+    # Mute dulu — user baru tidak bisa chat sebelum verifikasi join 4 channel
+    await mute_user_in_group(context, user.id)
+
     mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
     welcome_text = (
         f"Selamat Datang {mention}! 👋\n\n"
@@ -473,15 +581,21 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "KONTEN INDO TERUPDATE!!\n"
         "GRATIS TINGGAL NONTON\n"
         "DISINI👇👇👇\n\n"
-        "Ketik /akses di grup ini untuk akses channel!\n\n"
+        "⚠️ WAJIB join SEMUA channel di bawah ini dulu sebelum bisa chat di grup!\n\n"
+        "Setelah join semua, klik tombol \"✅ Saya Sudah Join Semua\" untuk verifikasi.\n\n"
         "Bisa request video di WJR Group ✔️\n"
         "Update Setiap Hari ✔️\n"
         "GRATIS seumur hidup ✔️"
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Akses Channel", callback_data="akses_welcome")]
-    ])
+    channel_buttons = [
+        [InlineKeyboardButton(name, url=link)]
+        for name, link in CHANNELS.items()
+    ]
+    channel_buttons.append(
+        [InlineKeyboardButton("✅ Saya Sudah Join Semua", callback_data=f"verify_join:{user.id}")]
+    )
+    keyboard = InlineKeyboardMarkup(channel_buttons)
 
     try:
         if WELCOME_FILE_ID:
@@ -613,6 +727,7 @@ def main() -> None:
     # ── GRUP ───────────────────────────────────────────────
     app.add_handler(CommandHandler("akses", akses, filters=filters.ChatType.GROUPS))
     app.add_handler(CallbackQueryHandler(akses_welcome_callback, pattern="^akses_welcome$"))
+    app.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join:"))
     app.add_handler(ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER))
 
     # Filter kata terlarang — teks biasa dan caption (foto/video)
