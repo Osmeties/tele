@@ -16,9 +16,12 @@ Fitur:
 
 import os
 import re
+import asyncio
 import logging
 import time
 from collections import defaultdict
+
+import asyncpg
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, ChatPermissions
 from telegram.ext import (
@@ -40,11 +43,14 @@ GROUP_ID        = int(os.getenv("GROUP_ID", "0"))
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 GROUP_LINK      = os.getenv("GROUP_LINK", "https://t.me/testingwjr")
 WELCOME_FILE_ID = os.getenv("WELCOME_FILE_ID", "")
+DATABASE_URL    = os.getenv("DATABASE_URL", "")
 
 if not TOKEN:
     raise EnvironmentError("BOT_TOKEN tidak ditemukan!")
 if GROUP_ID == 0:
     raise EnvironmentError("GROUP_ID tidak ditemukan!")
+if not DATABASE_URL:
+    raise EnvironmentError("DATABASE_URL tidak ditemukan! Tambahkan Postgres addon di Railway.")
 
 # ============================================================
 # CHANNELS (link untuk tombol)
@@ -153,9 +159,13 @@ _BANNED_PATTERN = re.compile(
 RATE_LIMIT             = 5
 RATE_WINDOW            = 60
 MENU_EXPIRE_SECONDS    = 300   # 5 menit
-WELCOME_DELETE_SECONDS = 900   # 15 menit (waktu untuk user join 4 channel & verifikasi)
+WELCOME_DELETE_SECONDS = 300   # 5 menit (welcome + verifikasi di private chat)
+GROUP_NOTICE_DELETE_SECONDS = 300   # 5 menit (notice singkat di grup yang arahkan ke DM)
 BROADCAST_INTERVAL     = 3 * 60 * 60  # 3 jam (detik)
 BROADCAST_FIRST_DELAY  = 60           # jeda pertama setelah bot start (detik)
+RECHECK_INTERVAL        = 12 * 60 * 60  # 12 jam (detik) — recheck membership channel
+RECHECK_FIRST_DELAY     = 5 * 60        # jeda pertama setelah bot start (detik)
+RECHECK_DELAY_PER_USER  = 0.3           # jeda antar user saat recheck, hindari flood limit
 
 # ============================================================
 # LOGGING
@@ -181,6 +191,48 @@ if _missing_channel_ids:
 # ============================================================
 _rate_store: dict[int, list[float]] = defaultdict(list)
 _last_broadcast_message_id: int | None = None
+_db_pool: asyncpg.Pool | None = None
+
+# ============================================================
+# DATABASE — verified_users (Railway Postgres)
+# ============================================================
+async def init_db_pool() -> None:
+    global _db_pool
+    _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verified_users (
+                user_id BIGINT PRIMARY KEY,
+                verified_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+    logger.info("Database pool siap, tabel verified_users dipastikan ada")
+
+async def close_db_pool() -> None:
+    if _db_pool is not None:
+        await _db_pool.close()
+
+async def mark_user_verified(user_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO verified_users (user_id, verified_at)
+            VALUES ($1, now())
+            ON CONFLICT (user_id) DO UPDATE SET verified_at = now()
+            """,
+            user_id,
+        )
+
+async def unmark_user_verified(user_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM verified_users WHERE user_id = $1", user_id)
+
+async def get_all_verified_users() -> list[int]:
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM verified_users")
+    return [r["user_id"] for r in rows]
 
 # ============================================================
 # HELPERS
@@ -374,6 +426,47 @@ async def broadcast_channels(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Gagal kirim broadcast: %s", e)
 
 # ============================================================
+# JOB: Recheck membership channel user yang sudah verifikasi (tiap 12 jam)
+# ============================================================
+async def recheck_verified_users(context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_ids = await get_all_verified_users()
+    logger.info("Recheck dimulai untuk %s user terverifikasi", len(user_ids))
+
+    rechecked  = 0
+    demoted    = 0
+
+    for user_id in user_ids:
+        try:
+            unjoined = await get_unjoined_channels(context, user_id)
+        except TelegramError as e:
+            logger.warning("Recheck gagal untuk user %s: %s", user_id, e)
+            await asyncio.sleep(RECHECK_DELAY_PER_USER)
+            continue
+
+        rechecked += 1
+
+        if unjoined:
+            await mute_user_in_group(context, user_id)
+            await unmark_user_verified(user_id)
+            demoted += 1
+            try:
+                names = ", ".join(unjoined)
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"⚠️ Kamu di-mute lagi di grup karena sudah keluar dari: {names}\n\n"
+                        "Join lagi semua channel lalu verifikasi ulang lewat /start di chat ini."
+                    ),
+                )
+            except TelegramError:
+                pass  # user mungkin sudah block bot, abaikan
+            logger.info("User %s di-mute ulang, belum join: %s", user_id, names)
+
+        await asyncio.sleep(RECHECK_DELAY_PER_USER)
+
+    logger.info("Recheck selesai. Dicek: %s, di-demote: %s", rechecked, demoted)
+
+# ============================================================
 # HELPER: Kirim menu channel + jadwalkan expire
 # ============================================================
 async def send_channel_menu(
@@ -426,6 +519,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⏳ Terlalu banyak permintaan. Coba lagi nanti.")
         return
 
+    # Deep-link payload "verify_<user_id>" — dari tombol notice di grup setelah join
+    payload = context.args[0] if context.args else ""
+    if payload.startswith("verify_"):
+        await send_private_welcome(context, user)
+        return
+
     keyboard = [[InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)]]
     await update.message.reply_text(
         "👋 Halo! Selamat datang di bot Warkop Jam Rawan!\n\n"
@@ -434,6 +533,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "lalu ketik /akses di dalam grup untuk akses channel.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+# ============================================================
+# PRIVATE CHAT — Kirim welcome + daftar channel + tombol verifikasi
+# ============================================================
+async def send_private_welcome(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    mention = user.first_name or "Kamu"
+    welcome_text = (
+        f"Selamat Datang {mention}! 👋\n\n"
+        "WELCOME TO WARKOP JAM RAWAN\n"
+        "🔥𝗧𝗘𝗠𝗣𝗔𝗧 𝗞𝗛𝗨𝗦𝗨𝗦 𝟭𝟴+🔥\n"
+        "KONTEN INDO TERUPDATE!!\n"
+        "GRATIS TINGGAL NONTON\n"
+        "DISINI👇👇👇\n\n"
+        "⚠️ WAJIB join SEMUA channel di bawah ini dulu sebelum bisa chat di grup!\n\n"
+        "Setelah join semua, klik tombol \"✅ Saya Sudah Join Semua\" untuk verifikasi.\n\n"
+        "Bisa request video di WJR Group ✔️\n"
+        "Update Setiap Hari ✔️\n"
+        "GRATIS seumur hidup ✔️\n\n"
+        "⏳ Pesan ini akan otomatis terhapus dalam 5 menit."
+    )
+
+    channel_buttons = [
+        [InlineKeyboardButton(name, url=link)]
+        for name, link in CHANNELS.items()
+    ]
+    channel_buttons.append(
+        [InlineKeyboardButton("✅ Saya Sudah Join Semua", callback_data=f"verify_join:{user.id}")]
+    )
+    keyboard = InlineKeyboardMarkup(channel_buttons)
+
+    try:
+        if WELCOME_FILE_ID:
+            sent = await context.bot.send_photo(
+                chat_id=user.id, photo=WELCOME_FILE_ID,
+                caption=welcome_text, parse_mode="HTML", reply_markup=keyboard,
+            )
+        else:
+            sent = await context.bot.send_message(
+                chat_id=user.id, text=welcome_text,
+                parse_mode="HTML", reply_markup=keyboard,
+            )
+
+        if context.job_queue is None:
+            logger.error("job_queue tidak aktif! Pastikan APScheduler terinstall.")
+        else:
+            context.job_queue.run_once(
+                expire_welcome,
+                when=WELCOME_DELETE_SECONDS,
+                data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user.id},
+                name=f"expire_welcome_{user.id}",
+            )
+        logger.info("Welcome + verifikasi dikirim ke private chat user %s, akan dihapus dalam %s detik",
+                    user.id, WELCOME_DELETE_SECONDS)
+    except Forbidden:
+        logger.warning("User %s belum pernah start bot, tidak bisa kirim DM", user.id)
+    except TelegramError as e:
+        logger.error("Gagal kirim welcome ke private chat user %s: %s", user.id, e)
 
 # ============================================================
 # GRUP — /akses
@@ -545,6 +701,7 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await unmute_user_in_group(context, clicker.id)
+    await mark_user_verified(clicker.id)
     await query.answer("✅ Verifikasi berhasil! Sekarang kamu bisa chat di grup.", show_alert=True)
     logger.info("User %s berhasil verifikasi join semua channel", clicker.id)
 
@@ -573,55 +730,40 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Mute dulu — user baru tidak bisa chat sebelum verifikasi join 4 channel
     await mute_user_in_group(context, user.id)
 
+    bot_username = (await context.bot.get_me()).username
+    deep_link = f"https://t.me/{bot_username}?start=verify_{user.id}"
+
     mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-    welcome_text = (
+    notice_text = (
         f"Selamat Datang {mention}! 👋\n\n"
-        "WELCOME TO WARKOP JAM RAWAN\n"
-        "🔥𝗧𝗘𝗠𝗣𝗔𝗧 𝗞𝗛𝗨𝗦𝗨𝗦 𝟭𝟴+🔥\n"
-        "KONTEN INDO TERUPDATE!!\n"
-        "GRATIS TINGGAL NONTON\n"
-        "DISINI👇👇👇\n\n"
-        "⚠️ WAJIB join SEMUA channel di bawah ini dulu sebelum bisa chat di grup!\n\n"
-        "Setelah join semua, klik tombol \"✅ Saya Sudah Join Semua\" untuk verifikasi.\n\n"
-        "Bisa request video di WJR Group ✔️\n"
-        "Update Setiap Hari ✔️\n"
-        "GRATIS seumur hidup ✔️"
+        "⚠️ Sebelum bisa chat di grup, lakukan verifikasi join channel dulu lewat chat pribadi bot.\n\n"
+        "Klik tombol di bawah 👇"
     )
 
-    channel_buttons = [
-        [InlineKeyboardButton(name, url=link)]
-        for name, link in CHANNELS.items()
-    ]
-    channel_buttons.append(
-        [InlineKeyboardButton("✅ Saya Sudah Join Semua", callback_data=f"verify_join:{user.id}")]
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔓 Buka Verifikasi", url=deep_link)]]
     )
-    keyboard = InlineKeyboardMarkup(channel_buttons)
 
     try:
-        if WELCOME_FILE_ID:
-            sent = await context.bot.send_photo(
-                chat_id=chat.id, photo=WELCOME_FILE_ID,
-                caption=welcome_text, parse_mode="HTML", reply_markup=keyboard,
-            )
-        else:
-            sent = await context.bot.send_message(
-                chat_id=chat.id, text=welcome_text,
-                parse_mode="HTML", reply_markup=keyboard,
-            )
+        sent = await context.bot.send_message(
+            chat_id=chat.id, text=notice_text,
+            parse_mode="HTML", reply_markup=keyboard,
+        )
 
-        # Jadwalkan auto-delete welcome message setelah 30 menit
+        # Jadwalkan auto-delete notice grup setelah 5 menit
         if context.job_queue is None:
             logger.error("job_queue tidak aktif! Pastikan APScheduler terinstall.")
         else:
             context.job_queue.run_once(
                 expire_welcome,
-                when=WELCOME_DELETE_SECONDS,
-                data={"chat_id": chat.id, "message_id": sent.message_id, "user_id": user.id},
-                name=f"expire_welcome_{user.id}",
+                when=GROUP_NOTICE_DELETE_SECONDS,
+                data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user.id},
+                name=f"expire_group_notice_{user.id}",
             )
-        logger.info("Welcome message dikirim ke user %s, akan dihapus dalam 30 menit", user.id)
+        logger.info("Notice verifikasi dikirim ke grup untuk user %s, akan dihapus dalam %s detik",
+                    user.id, GROUP_NOTICE_DELETE_SECONDS)
     except TelegramError as e:
-        logger.error("Gagal kirim welcome message: %s", e)
+        logger.error("Gagal kirim notice verifikasi: %s", e)
 
 # ============================================================
 # PRIVATE CHAT — /getfileid (admin)
@@ -695,10 +837,22 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============================================================
 # MAIN
 # ============================================================
+async def post_init(app) -> None:
+    await init_db_pool()
+
+async def post_shutdown(app) -> None:
+    await close_db_pool()
+
 def main() -> None:
     logger.info("Bot dimulai...")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Validasi job_queue aktif saat startup
     if app.job_queue is None:
@@ -716,6 +870,15 @@ def main() -> None:
         name="broadcast_channels",
     )
     logger.info("Broadcast berkala dijadwalkan setiap %s detik", BROADCAST_INTERVAL)
+
+    # Jadwalkan recheck membership channel user terverifikasi (setiap 12 jam)
+    app.job_queue.run_repeating(
+        recheck_verified_users,
+        interval=RECHECK_INTERVAL,
+        first=RECHECK_FIRST_DELAY,
+        name="recheck_verified_users",
+    )
+    logger.info("Recheck verifikasi dijadwalkan setiap %s detik", RECHECK_INTERVAL)
 
     # ── PRIVATE CHAT ───────────────────────────────────────
     app.add_handler(CommandHandler("start",     start,       filters=filters.ChatType.PRIVATE))
