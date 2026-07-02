@@ -525,14 +525,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_private_welcome(context, user)
         return
 
-    keyboard = [[InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)]]
-    await update.message.reply_text(
-        "👋 Halo! Selamat datang di bot Warkop Jam Rawan!\n\n"
-        "⚠️ Kamu harus join grup dulu sebelum bisa akses channel.\n\n"
-        "Klik tombol di bawah untuk bergabung, "
-        "lalu ketik /akses di dalam grup untuk akses channel.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    # Tidak ada payload — cek dulu apakah user sudah member grup
+    try:
+        member = await context.bot.get_chat_member(GROUP_ID, user.id)
+        is_member = member.status not in ("left", "kicked")
+    except TelegramError:
+        is_member = False
+
+    if is_member:
+        # Sudah di grup → langsung tampilkan verifikasi channel
+        await send_private_welcome(context, user)
+    else:
+        # Belum di grup → suruh join dulu
+        keyboard = [[InlineKeyboardButton("📌 Join Grup Sekarang", url=GROUP_LINK)]]
+        await update.message.reply_text(
+            "👋 Halo! Selamat datang di bot Warkop Jam Rawan!\n\n"
+            "⚠️ Kamu harus join grup dulu sebelum bisa akses channel.\n\n"
+            "Klik tombol di bawah untuk bergabung, "
+            "lalu kembali ke sini dan ketik /start lagi.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 # ============================================================
 # PRIVATE CHAT — Kirim welcome + daftar channel + tombol verifikasi
@@ -702,7 +714,28 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await unmute_user_in_group(context, clicker.id)
     await mark_user_verified(clicker.id)
-    await query.answer("✅ Verifikasi berhasil! Sekarang kamu bisa chat di grup.", show_alert=True)
+    await query.answer("✅ Verifikasi berhasil! Sekarang kamu sudah bisa chat di grup.", show_alert=True)
+
+    # Kirim pesan selamat di private chat
+    try:
+        sent = await context.bot.send_message(
+            chat_id=clicker.id,
+            text=(
+                "🎉 Selamat! Kamu sudah bisa chat di grup!\n\n"
+                "Akses kamu telah diaktifkan. Silakan kembali ke grup dan mulai ngobrol. 🗨️"
+            ),
+        )
+        # Auto-delete pesan selamat setelah 5 menit
+        if context.job_queue:
+            context.job_queue.run_once(
+                expire_welcome,
+                when=WELCOME_DELETE_SECONDS,
+                data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": clicker.id},
+                name=f"expire_success_{clicker.id}",
+            )
+    except TelegramError as e:
+        logger.warning("Gagal kirim pesan selamat ke user %s: %s", clicker.id, e)
+
     logger.info("User %s berhasil verifikasi join semua channel", clicker.id)
 
 # ============================================================
