@@ -163,9 +163,10 @@ WELCOME_DELETE_SECONDS = 300   # 5 menit (welcome + verifikasi di private chat)
 GROUP_NOTICE_DELETE_SECONDS = 300   # 5 menit (notice singkat di grup yang arahkan ke DM)
 BROADCAST_INTERVAL     = 3 * 60 * 60  # 3 jam (detik)
 BROADCAST_FIRST_DELAY  = 60           # jeda pertama setelah bot start (detik)
-RECHECK_INTERVAL        = 12 * 60 * 60  # 12 jam (detik) — recheck membership channel
+RECHECK_INTERVAL        = 1 * 60 * 60   # 1 jam (detik) — recheck membership channel
 RECHECK_FIRST_DELAY     = 5 * 60        # jeda pertama setelah bot start (detik)
 RECHECK_DELAY_PER_USER  = 0.3           # jeda antar user saat recheck, hindari flood limit
+WARNING_GRACE_SECONDS   = 1 * 60 * 60   # 1 jam grace period setelah warning sebelum di-mute
 
 # ============================================================
 # LOGGING
@@ -208,7 +209,25 @@ async def init_db_pool() -> None:
             )
             """
         )
-    logger.info("Database pool siap, tabel verified_users dipastikan ada")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_verifications (
+                user_id BIGINT PRIMARY KEY,
+                message_id BIGINT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS warned_users (
+                user_id BIGINT PRIMARY KEY,
+                warned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deadline TIMESTAMPTZ NOT NULL,
+                unjoined_channels TEXT NOT NULL
+            )
+            """
+        )
+    logger.info("Database pool siap, tabel verified_users, pending_verifications & warned_users dipastikan ada")
 
 async def close_db_pool() -> None:
     if _db_pool is not None:
@@ -233,6 +252,62 @@ async def get_all_verified_users() -> list[int]:
     async with _db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM verified_users")
     return [r["user_id"] for r in rows]
+
+async def save_pending_message(user_id: int, message_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO pending_verifications (user_id, message_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET message_id = $2
+            """,
+            user_id, message_id,
+        )
+
+async def get_pending_message(user_id: int) -> int | None:
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT message_id FROM pending_verifications WHERE user_id = $1", user_id
+        )
+    return row["message_id"] if row else None
+
+async def delete_pending_message(user_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_verifications WHERE user_id = $1", user_id
+        )
+
+async def save_warning(user_id: int, unjoined_channels: list[str]) -> None:
+    import datetime
+    deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=WARNING_GRACE_SECONDS)
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO warned_users (user_id, warned_at, deadline, unjoined_channels)
+            VALUES ($1, now(), $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET warned_at = now(), deadline = $2, unjoined_channels = $3
+            """,
+            user_id, deadline, ",".join(unjoined_channels),
+        )
+
+async def get_expired_warnings() -> list[dict]:
+    """Ambil semua user yang sudah melewati deadline warning."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, unjoined_channels FROM warned_users WHERE deadline <= $1", now
+        )
+    return [{"user_id": r["user_id"], "unjoined_channels": r["unjoined_channels"].split(",")} for r in rows]
+
+async def get_warned_user_ids() -> set[int]:
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM warned_users")
+    return {r["user_id"] for r in rows}
+
+async def delete_warning(user_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM warned_users WHERE user_id = $1", user_id)
 
 # ============================================================
 # HELPERS
@@ -426,16 +501,55 @@ async def broadcast_channels(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Gagal kirim broadcast: %s", e)
 
 # ============================================================
-# JOB: Recheck membership channel user yang sudah verifikasi (tiap 12 jam)
+# JOB: Recheck membership channel — sistem 2 tahap (warning → mute)
 # ============================================================
 async def recheck_verified_users(context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_ids = await get_all_verified_users()
-    logger.info("Recheck dimulai untuk %s user terverifikasi", len(user_ids))
+    logger.info("Recheck dimulai...")
 
-    rechecked  = 0
-    demoted    = 0
+    # ── TAHAP 1: Eksekusi user yang sudah melewati deadline warning ──
+    expired = await get_expired_warnings()
+    for entry in expired:
+        user_id  = entry["user_id"]
+        unjoined = entry["unjoined_channels"]
+        try:
+            still_unjoined = await get_unjoined_channels(context, user_id)
+        except TelegramError:
+            still_unjoined = unjoined  # anggap masih belum join kalau error
+
+        if still_unjoined:
+            # Belum join juga setelah 1 jam — mute dan hapus dari verified
+            await mute_user_in_group(context, user_id)
+            await unmark_user_verified(user_id)
+            try:
+                names = ", ".join(still_unjoined)
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"🚫 Akses chat kamu di grup telah dinonaktifkan karena kamu tidak join kembali ke: {names}\n\n"
+                        "Silakan join semua channel lalu ketik /start di chat ini untuk verifikasi ulang."
+                    ),
+                )
+            except TelegramError:
+                pass
+            logger.info("User %s di-mute setelah grace period habis, belum join: %s", user_id, still_unjoined)
+        else:
+            # Sudah join kembali sebelum deadline — hapus warning, biarkan tetap bisa chat
+            logger.info("User %s sudah join kembali sebelum deadline, warning dihapus", user_id)
+
+        await delete_warning(user_id)
+        await asyncio.sleep(RECHECK_DELAY_PER_USER)
+
+    # ── TAHAP 2: Cek semua verified user, beri warning kalau ada yang keluar ──
+    warned_ids  = await get_warned_user_ids()  # skip yang sudah dapat warning
+    user_ids    = await get_all_verified_users()
+    rechecked   = 0
+    warned_new  = 0
 
     for user_id in user_ids:
+        if user_id in warned_ids:
+            await asyncio.sleep(RECHECK_DELAY_PER_USER)
+            continue  # sudah dalam masa warning, tunggu deadline
+
         try:
             unjoined = await get_unjoined_channels(context, user_id)
         except TelegramError as e:
@@ -446,25 +560,27 @@ async def recheck_verified_users(context: ContextTypes.DEFAULT_TYPE) -> None:
         rechecked += 1
 
         if unjoined:
-            await mute_user_in_group(context, user_id)
-            await unmark_user_verified(user_id)
-            demoted += 1
+            # Kirim warning, beri waktu 1 jam
+            await save_warning(user_id, unjoined)
+            warned_new += 1
             try:
                 names = ", ".join(unjoined)
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=(
-                        f"⚠️ Kamu di-mute lagi di grup karena sudah keluar dari: {names}\n\n"
-                        "Join lagi semua channel lalu verifikasi ulang lewat /start di chat ini."
+                        f"⚠️ Peringatan! Kamu terdeteksi keluar dari: {names}\n\n"
+                        "Kamu punya waktu 1 jam untuk join kembali semua channel.\n"
+                        "Jika tidak, akses chat di grup akan dinonaktifkan otomatis."
                     ),
                 )
             except TelegramError:
-                pass  # user mungkin sudah block bot, abaikan
-            logger.info("User %s di-mute ulang, belum join: %s", user_id, names)
+                pass
+            logger.info("Warning dikirim ke user %s, belum join: %s", user_id, unjoined)
 
         await asyncio.sleep(RECHECK_DELAY_PER_USER)
 
-    logger.info("Recheck selesai. Dicek: %s, di-demote: %s", rechecked, demoted)
+    logger.info("Recheck selesai. Dicek: %s, warning baru: %s, dieksekusi: %s",
+                rechecked, warned_new, len(expired))
 
 # ============================================================
 # HELPER: Kirim menu channel + jadwalkan expire
@@ -562,8 +678,7 @@ async def send_private_welcome(context: ContextTypes.DEFAULT_TYPE, user) -> None
         "Setelah join semua, klik tombol \"✅ Saya Sudah Join Semua\" untuk verifikasi.\n\n"
         "Bisa request video di WJR Group ✔️\n"
         "Update Setiap Hari ✔️\n"
-        "GRATIS seumur hidup ✔️\n\n"
-        "⏳ Pesan ini akan otomatis terhapus dalam 5 menit."
+        "GRATIS seumur hidup ✔️"
     )
 
     channel_buttons = [
@@ -587,17 +702,9 @@ async def send_private_welcome(context: ContextTypes.DEFAULT_TYPE, user) -> None
                 parse_mode="HTML", reply_markup=keyboard,
             )
 
-        if context.job_queue is None:
-            logger.error("job_queue tidak aktif! Pastikan APScheduler terinstall.")
-        else:
-            context.job_queue.run_once(
-                expire_welcome,
-                when=WELCOME_DELETE_SECONDS,
-                data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": user.id},
-                name=f"expire_welcome_{user.id}",
-            )
-        logger.info("Welcome + verifikasi dikirim ke private chat user %s, akan dihapus dalam %s detik",
-                    user.id, WELCOME_DELETE_SECONDS)
+        # Simpan message_id ke DB — akan dihapus otomatis setelah verifikasi berhasil
+        await save_pending_message(user.id, sent.message_id)
+        logger.info("Welcome + verifikasi dikirim ke private chat user %s", user.id)
     except Forbidden:
         logger.warning("User %s belum pernah start bot, tidak bisa kirim DM", user.id)
     except TelegramError as e:
@@ -714,25 +821,27 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await unmute_user_in_group(context, clicker.id)
     await mark_user_verified(clicker.id)
+    await delete_warning(clicker.id)  # hapus warning kalau ada (verifikasi ulang setelah kena warning)
     await query.answer("✅ Verifikasi berhasil! Sekarang kamu sudah bisa chat di grup.", show_alert=True)
+
+    # Hapus pesan welcome+verifikasi yang ada di private chat
+    welcome_msg_id = await get_pending_message(clicker.id)
+    if welcome_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=clicker.id, message_id=welcome_msg_id)
+        except TelegramError:
+            pass  # Sudah terhapus atau tidak bisa dihapus, abaikan
+        await delete_pending_message(clicker.id)
 
     # Kirim pesan selamat di private chat
     try:
-        sent = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=clicker.id,
             text=(
                 "🎉 Selamat! Kamu sudah bisa chat di grup!\n\n"
                 "Akses kamu telah diaktifkan. Silakan kembali ke grup dan mulai ngobrol. 🗨️"
             ),
         )
-        # Auto-delete pesan selamat setelah 5 menit
-        if context.job_queue:
-            context.job_queue.run_once(
-                expire_welcome,
-                when=WELCOME_DELETE_SECONDS,
-                data={"chat_id": sent.chat_id, "message_id": sent.message_id, "user_id": clicker.id},
-                name=f"expire_success_{clicker.id}",
-            )
     except TelegramError as e:
         logger.warning("Gagal kirim pesan selamat ke user %s: %s", clicker.id, e)
 
