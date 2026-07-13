@@ -387,7 +387,7 @@ async def unmute_user_in_group(context: ContextTypes.DEFAULT_TYPE, user_id: int)
 # GRUP — Filter pesan kata terlarang (delete only)
 # ============================================================
 async def filter_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-delete pesan yang mengandung kata terlarang. Tanpa warn/kick."""
+    """Auto-delete pesan yang mengandung kata terlarang + kirim warning lewat DM."""
     msg = update.message or update.edited_message
     if not msg:
         return
@@ -416,7 +416,7 @@ async def filter_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not contains_banned_word(text):
         return
 
-    # Hapus pesan diam-diam (tanpa notifikasi apapun)
+    # Hapus pesan
     try:
         await msg.delete()
         logger.info(
@@ -425,6 +425,40 @@ async def filter_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     except TelegramError as e:
         logger.warning("Gagal hapus pesan dari user %s: %s", user.id, e)
+
+    # Kirim warning lewat DM bot
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "⚠️ Peringatan!\n\n"
+                "Pesanmu di grup dihapus karena mengandung kata-kata yang tidak diizinkan.\n\n"
+                "Harap jaga sopan santun dan ikuti aturan grup. "
+                "Pelanggaran berulang dapat mengakibatkan pemblokiran akses chat."
+            ),
+        )
+        logger.info("Warning DM terkirim ke user %s", user.id)
+    except Forbidden:
+        # User belum pernah start bot — kirim notif singkat di grup sebagai reply, auto-delete 30 detik
+        try:
+            mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+            notif = await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"⚠️ {mention}, pesanmu dihapus karena melanggar aturan grup.",
+                parse_mode="HTML",
+            )
+            # Auto-delete notif setelah 30 detik
+            if context.job_queue:
+                context.job_queue.run_once(
+                    expire_welcome,
+                    when=30,
+                    data={"chat_id": notif.chat_id, "message_id": notif.message_id, "user_id": user.id},
+                    name=f"expire_warn_notif_{user.id}",
+                )
+        except TelegramError:
+            pass
+    except TelegramError as e:
+        logger.warning("Gagal kirim warning DM ke user %s: %s", user.id, e)
 
 # ============================================================
 # JOB: Expire menu — hapus pesan otomatis setelah 5 menit
