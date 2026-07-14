@@ -167,6 +167,8 @@ RECHECK_INTERVAL        = 1 * 60 * 60   # 1 jam (detik) — recheck membership c
 RECHECK_FIRST_DELAY     = 5 * 60        # jeda pertama setelah bot start (detik)
 RECHECK_DELAY_PER_USER  = 0.3           # jeda antar user saat recheck, hindari flood limit
 WARNING_GRACE_SECONDS   = 1 * 60 * 60   # 1 jam grace period setelah warning sebelum di-mute
+WARN_MAX                = 3             # maksimal pelanggaran sebelum di-mute sementara
+WARN_MUTE_SECONDS       = 60 * 60       # durasi mute setelah 3 pelanggaran (1 jam)
 
 # ============================================================
 # LOGGING
@@ -227,7 +229,16 @@ async def init_db_pool() -> None:
             )
             """
         )
-    logger.info("Database pool siap, tabel verified_users, pending_verifications & warned_users dipastikan ada")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_warnings (
+                user_id BIGINT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_warned_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+    logger.info("Database pool siap, semua tabel dipastikan ada")
 
 async def close_db_pool() -> None:
     if _db_pool is not None:
@@ -308,6 +319,26 @@ async def get_warned_user_ids() -> set[int]:
 async def delete_warning(user_id: int) -> None:
     async with _db_pool.acquire() as conn:
         await conn.execute("DELETE FROM warned_users WHERE user_id = $1", user_id)
+
+async def add_user_warn(user_id: int) -> int:
+    """Tambah 1 pelanggaran, return jumlah total warn sekarang."""
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_warnings (user_id, count, last_warned_at)
+            VALUES ($1, 1, now())
+            ON CONFLICT (user_id) DO UPDATE
+                SET count = user_warnings.count + 1,
+                    last_warned_at = now()
+            RETURNING count
+            """,
+            user_id,
+        )
+    return row["count"]
+
+async def reset_user_warn(user_id: int) -> None:
+    async with _db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM user_warnings WHERE user_id = $1", user_id)
 
 # ============================================================
 # HELPERS
@@ -426,39 +457,86 @@ async def filter_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
     except TelegramError as e:
         logger.warning("Gagal hapus pesan dari user %s: %s", user.id, e)
 
-    # Kirim warning lewat DM bot
-    try:
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=(
-                "⚠️ Peringatan!\n\n"
-                "Pesanmu di grup dihapus karena mengandung kata-kata yang tidak diizinkan.\n\n"
-                "Harap jaga sopan santun dan ikuti aturan grup. "
-                "Pelanggaran berulang dapat mengakibatkan pemblokiran akses chat."
-            ),
-        )
-        logger.info("Warning DM terkirim ke user %s", user.id)
-    except Forbidden:
-        # User belum pernah start bot — kirim notif singkat di grup sebagai reply, auto-delete 30 detik
+    # Tambah hitungan pelanggaran
+    warn_count = await add_user_warn(user.id)
+    remaining  = WARN_MAX - warn_count
+
+    if warn_count >= WARN_MAX:
+        # Sudah 3x pelanggaran — mute 1 jam dan reset hitungan
+        import datetime
+        until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=WARN_MUTE_SECONDS)
         try:
-            mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
-            notif = await context.bot.send_message(
+            await context.bot.restrict_chat_member(
                 chat_id=GROUP_ID,
-                text=f"⚠️ {mention}, pesanmu dihapus karena melanggar aturan grup.",
-                parse_mode="HTML",
+                user_id=user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
             )
-            # Auto-delete notif setelah 30 detik
-            if context.job_queue:
-                context.job_queue.run_once(
-                    expire_welcome,
-                    when=30,
-                    data={"chat_id": notif.chat_id, "message_id": notif.message_id, "user_id": user.id},
-                    name=f"expire_warn_notif_{user.id}",
-                )
+            logger.info("User %s di-mute 1 jam setelah %s pelanggaran", user.id, warn_count)
+        except TelegramError as e:
+            logger.warning("Gagal mute user %s: %s", user.id, e)
+
+        await reset_user_warn(user.id)
+
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    "🚫 Kamu telah di-mute selama 1 jam karena sudah 3x mengirim pesan "
+                    "yang melanggar aturan grup.\n\n"
+                    "Setelah 1 jam, kamu bisa chat kembali. Harap patuhi aturan grup."
+                ),
+            )
         except TelegramError:
-            pass
-    except TelegramError as e:
-        logger.warning("Gagal kirim warning DM ke user %s: %s", user.id, e)
+            try:
+                mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+                notif = await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"🚫 {mention} di-mute 1 jam karena 3x melanggar aturan grup.",
+                    parse_mode="HTML",
+                )
+                if context.job_queue:
+                    context.job_queue.run_once(
+                        expire_welcome,
+                        when=30,
+                        data={"chat_id": notif.chat_id, "message_id": notif.message_id, "user_id": user.id},
+                        name=f"expire_mute_notif_{user.id}",
+                    )
+            except TelegramError:
+                pass
+    else:
+        # Masih di bawah 3 — kirim warning DM
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    f"⚠️ Peringatan {warn_count}/{WARN_MAX}!\n\n"
+                    "Pesanmu di grup dihapus karena mengandung kata-kata yang tidak diizinkan.\n\n"
+                    f"Kamu masih punya {remaining} kesempatan sebelum di-mute selama 1 jam. "
+                    "Harap jaga sopan santun dan ikuti aturan grup."
+                ),
+            )
+            logger.info("Warning DM %s/%s terkirim ke user %s", warn_count, WARN_MAX, user.id)
+        except Forbidden:
+            # User belum pernah start bot — notif singkat di grup, auto-delete 30 detik
+            try:
+                mention = f'<a href="tg://user?id={user.id}">{user.first_name}</a>'
+                notif = await context.bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=f"⚠️ {mention}, pesanmu dihapus karena melanggar aturan grup. ({warn_count}/{WARN_MAX})",
+                    parse_mode="HTML",
+                )
+                if context.job_queue:
+                    context.job_queue.run_once(
+                        expire_welcome,
+                        when=30,
+                        data={"chat_id": notif.chat_id, "message_id": notif.message_id, "user_id": user.id},
+                        name=f"expire_warn_notif_{user.id}",
+                    )
+            except TelegramError:
+                pass
+        except TelegramError as e:
+            logger.warning("Gagal kirim warning DM ke user %s: %s", user.id, e)
 
 # ============================================================
 # JOB: Expire menu — hapus pesan otomatis setelah 5 menit
